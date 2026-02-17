@@ -94,6 +94,10 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 if "agent" not in st.session_state:
     st.session_state.agent = None
+if "uploaded_count" not in st.session_state:
+    st.session_state.uploaded_count = 0
+if "last_upload_result" not in st.session_state:
+    st.session_state.last_upload_result = None
 
 
 def get_badge_class(chunk_type: str) -> str:
@@ -181,6 +185,80 @@ with st.sidebar:
         agent_stats = st.session_state.agent.get_stats()
         st.metric("Vectors Indexed", agent_stats["total_vectors"])
         st.caption(f"Mode: {agent_stats['mode']} | Top-K: {agent_stats['top_k']}")
+
+    # --- Document Upload Section ---
+    if st.session_state.agent:
+        st.markdown("---")
+        st.markdown("### Upload Contract")
+        st.caption("Add a new contract to the corpus in real time.")
+
+        uploaded_file = st.file_uploader(
+            "Choose a .txt contract file",
+            type=["txt"],
+            help=(
+                "Upload a contract document in the standard format with "
+                "CONTRACT NUMBER, FAR/DFARS clauses, and section headers."
+            ),
+            key="contract_uploader",
+        )
+
+        if uploaded_file is not None:
+            # Read file content
+            file_content = uploaded_file.read().decode("utf-8")
+
+            if st.button("Process & Index", type="primary", use_container_width=True):
+                with st.status("Ingesting document into corpus...", expanded=True) as status:
+                    # Step 1: Validation
+                    st.write("Validating document format...")
+                    from src.ingestion.upload_manager import validate_upload
+                    is_valid, error_msg = validate_upload(file_content)
+
+                    if not is_valid:
+                        st.error(f"Validation failed: {error_msg}")
+                        status.update(label="Upload failed", state="error")
+                    else:
+                        st.write("Document structure verified.")
+
+                        # Step 2: Chunking + Embedding + Indexing
+                        st.write("Splitting into clause-aware chunks...")
+                        result = st.session_state.agent.ingest_document(
+                            file_content=file_content,
+                            filename=uploaded_file.name,
+                        )
+
+                        if result.get("error"):
+                            st.error(f"Processing error: {result['error']}")
+                            status.update(label="Upload failed", state="error")
+                        else:
+                            # Step 3: Show results
+                            st.write(
+                                f"Created **{result['num_chunks']}** chunks "
+                                f"from contract **{result['contract_number']}**"
+                            )
+
+                            # Show chunk type breakdown
+                            type_parts = [
+                                f"{count} {ctype}"
+                                for ctype, count in result["chunk_types"].items()
+                            ]
+                            st.write(f"Chunk types: {', '.join(type_parts)}")
+
+                            st.write("Embedding and indexing into vector store...")
+                            st.write(
+                                f"Refreshing retriever... **{result['new_total_vectors']}** "
+                                f"total vectors now indexed."
+                            )
+
+                            status.update(label="Document indexed successfully!", state="complete")
+
+                            st.session_state.uploaded_count += 1
+                            st.session_state.last_upload_result = result
+
+        # Show upload history
+        if st.session_state.uploaded_count > 0:
+            st.success(
+                f"{st.session_state.uploaded_count} document(s) uploaded this session"
+            )
 
     st.markdown("---")
 
