@@ -22,7 +22,7 @@ from langchain_core.runnables import RunnablePassthrough
 from .prompts import SYSTEM_PROMPT, RAG_PROMPT_TEMPLATE
 from .mock_llm import generate_mock_response
 from ..retrieval.vector_store import load_vector_store, get_retriever
-from ..ingestion.upload_manager import validate_upload, process_upload
+from ..ingestion.upload_manager import validate_upload, process_upload, process_docx_upload
 
 
 def _extract_value_filter(question: str) -> dict | None:
@@ -279,27 +279,40 @@ class ContractAgent:
 
     def ingest_document(
         self,
-        file_content: str,
+        file_content: str | bytes,
         filename: str,
         save_directory: str = "./data/synthetic/documents",
     ) -> dict:
         """
         Ingest a new document into the vector store in real time.
 
-        Validates the document, chunks it, adds to ChromaDB, and refreshes
-        the retriever so queries immediately reflect the new content.
+        Routes by file extension:
+        - .txt: Validates for standard format, chunks directly
+        - .docx: Uses hybrid extraction (regex + LLM), generates text, chunks
 
         Args:
-            file_content: Raw text content of the uploaded file.
-            filename: Original filename.
+            file_content: Raw text (str for .txt) or raw bytes (bytes for .docx).
+            filename: Original filename (extension determines processing path).
             save_directory: Where to persist the uploaded file on disk.
 
         Returns:
             Dict with processing stats and validation results.
             Contains 'valid' key (bool) and 'error' key (str) if invalid.
+            For .docx, also contains 'extraction_report' with field details.
         """
+        ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+
+        # Route .docx files to hybrid extraction pipeline
+        if ext == "docx" or isinstance(file_content, bytes):
+            return self._ingest_docx(file_content, filename, save_directory)
+
+        # Standard .txt pipeline
+        return self._ingest_txt(file_content, filename, save_directory)
+
+    def _ingest_txt(self, file_content: str, filename: str, save_directory: str) -> dict:
+        """Ingest a .txt contract file."""
         # Validate first
-        is_valid, error_msg = validate_upload(file_content)
+        is_valid, error_msg = validate_upload(file_content, filename)
         if not is_valid:
             return {"valid": False, "error": error_msg}
 
@@ -310,6 +323,40 @@ class ContractAgent:
             vector_store=self.vector_store,
             save_directory=save_directory,
         )
+
+        # Refresh the retriever to include new documents
+        self.retriever = get_retriever(self.vector_store, top_k=self.top_k)
+
+        result["valid"] = True
+        result["new_total_vectors"] = self.vector_store._collection.count()
+        return result
+
+    def _ingest_docx(self, file_content: bytes, filename: str, save_directory: str) -> dict:
+        """Ingest a .docx contract file via hybrid extraction."""
+        # Validate the docx file
+        is_valid, error_msg = validate_upload(file_content, filename)
+        if not is_valid:
+            return {"valid": False, "error": error_msg}
+
+        # Determine API key for LLM extraction
+        api_key = None
+        if self.mode == "anthropic":
+            # Reuse the agent's API key for extraction too
+            api_key = getattr(self, "_anthropic_api_key", None)
+
+        # Process through hybrid extraction pipeline
+        result = process_docx_upload(
+            file_bytes=file_content,
+            filename=filename,
+            vector_store=self.vector_store,
+            save_directory=save_directory,
+            mode=self.mode,
+            api_key=api_key,
+        )
+
+        if result.get("error"):
+            result["valid"] = False
+            return result
 
         # Refresh the retriever to include new documents
         self.retriever = get_retriever(self.vector_store, top_k=self.top_k)

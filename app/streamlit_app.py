@@ -193,66 +193,25 @@ with st.sidebar:
         st.caption("Add a new contract to the corpus in real time.")
 
         uploaded_file = st.file_uploader(
-            "Choose a .txt contract file",
-            type=["txt"],
+            "Choose a contract file (.txt or .docx)",
+            type=["txt", "docx"],
             help=(
-                "Upload a contract document in the standard format with "
-                "CONTRACT NUMBER, FAR/DFARS clauses, and section headers."
+                "Upload a contract document. "
+                "**.txt** files must follow the standard format with CONTRACT NUMBER and section headers. "
+                "**.docx** files are processed via hybrid extraction (regex + LLM) to automatically "
+                "extract structured fields, clauses, and narrative content."
             ),
             key="contract_uploader",
         )
 
         if uploaded_file is not None:
-            # Read file content
-            file_content = uploaded_file.read().decode("utf-8")
+            is_docx = uploaded_file.name.lower().endswith(".docx")
 
             if st.button("Process & Index", type="primary", use_container_width=True):
-                with st.status("Ingesting document into corpus...", expanded=True) as status:
-                    # Step 1: Validation
-                    st.write("Validating document format...")
-                    from src.ingestion.upload_manager import validate_upload
-                    is_valid, error_msg = validate_upload(file_content)
-
-                    if not is_valid:
-                        st.error(f"Validation failed: {error_msg}")
-                        status.update(label="Upload failed", state="error")
-                    else:
-                        st.write("Document structure verified.")
-
-                        # Step 2: Chunking + Embedding + Indexing
-                        st.write("Splitting into clause-aware chunks...")
-                        result = st.session_state.agent.ingest_document(
-                            file_content=file_content,
-                            filename=uploaded_file.name,
-                        )
-
-                        if result.get("error"):
-                            st.error(f"Processing error: {result['error']}")
-                            status.update(label="Upload failed", state="error")
-                        else:
-                            # Step 3: Show results
-                            st.write(
-                                f"Created **{result['num_chunks']}** chunks "
-                                f"from contract **{result['contract_number']}**"
-                            )
-
-                            # Show chunk type breakdown
-                            type_parts = [
-                                f"{count} {ctype}"
-                                for ctype, count in result["chunk_types"].items()
-                            ]
-                            st.write(f"Chunk types: {', '.join(type_parts)}")
-
-                            st.write("Embedding and indexing into vector store...")
-                            st.write(
-                                f"Refreshing retriever... **{result['new_total_vectors']}** "
-                                f"total vectors now indexed."
-                            )
-
-                            status.update(label="Document indexed successfully!", state="complete")
-
-                            st.session_state.uploaded_count += 1
-                            st.session_state.last_upload_result = result
+                if is_docx:
+                    _process_docx_upload(uploaded_file)
+                else:
+                    _process_txt_upload(uploaded_file)
 
         # Show upload history
         if st.session_state.uploaded_count > 0:
@@ -277,6 +236,102 @@ with st.sidebar:
     for q in sample_queries:
         if st.button(q, key=f"sample_{hash(q)}", use_container_width=True):
             st.session_state.pending_query = q
+
+
+def _process_txt_upload(uploaded_file):
+    """Handle .txt file upload processing."""
+    file_content = uploaded_file.read().decode("utf-8")
+
+    with st.status("Ingesting document into corpus...", expanded=True) as status:
+        st.write("Validating document format...")
+        from src.ingestion.upload_manager import validate_upload
+        is_valid, error_msg = validate_upload(file_content, uploaded_file.name)
+
+        if not is_valid:
+            st.error(f"Validation failed: {error_msg}")
+            status.update(label="Upload failed", state="error")
+        else:
+            st.write("Document structure verified.")
+            st.write("Splitting into clause-aware chunks...")
+
+            result = st.session_state.agent.ingest_document(
+                file_content=file_content,
+                filename=uploaded_file.name,
+            )
+
+            if result.get("error"):
+                st.error(f"Processing error: {result['error']}")
+                status.update(label="Upload failed", state="error")
+            else:
+                st.write(
+                    f"Created **{result['num_chunks']}** chunks "
+                    f"from contract **{result['contract_number']}**"
+                )
+                type_parts = [
+                    f"{count} {ctype}"
+                    for ctype, count in result["chunk_types"].items()
+                ]
+                st.write(f"Chunk types: {', '.join(type_parts)}")
+                st.write(
+                    f"**{result['new_total_vectors']}** total vectors now indexed."
+                )
+                status.update(label="Document indexed successfully!", state="complete")
+                st.session_state.uploaded_count += 1
+                st.session_state.last_upload_result = result
+
+
+def _process_docx_upload(uploaded_file):
+    """Handle .docx file upload with hybrid extraction progress display."""
+    file_bytes = uploaded_file.read()
+
+    with st.status("Extracting and indexing Word document...", expanded=True) as status:
+        st.write("Parsing Word document...")
+        st.write("Extracting structured fields (regex)...")
+        st.write("Extracting narrative fields (LLM)...")
+        st.write("Merging results and generating contract record...")
+
+        result = st.session_state.agent.ingest_document(
+            file_content=file_bytes,
+            filename=uploaded_file.name,
+        )
+
+        if not result.get("valid"):
+            st.error(f"Processing error: {result.get('error', 'Unknown error')}")
+            status.update(label="Upload failed", state="error")
+        else:
+            st.write("Chunking and indexing into vector store...")
+            st.write(
+                f"Created **{result['num_chunks']}** chunks "
+                f"from contract **{result['contract_number']}**"
+            )
+            type_parts = [
+                f"{count} {ctype}"
+                for ctype, count in result.get("chunk_types", {}).items()
+            ]
+            if type_parts:
+                st.write(f"Chunk types: {', '.join(type_parts)}")
+            st.write(
+                f"**{result['new_total_vectors']}** total vectors now indexed."
+            )
+
+            status.update(label="Word document extracted and indexed!", state="complete")
+            st.session_state.uploaded_count += 1
+            st.session_state.last_upload_result = result
+
+            # Show extraction report in expander
+            report = result.get("extraction_report")
+            if report:
+                with st.expander("Extraction Report", expanded=True):
+                    cols = st.columns(4)
+                    cols[0].metric("Total Fields", report["total_fields"])
+                    cols[1].metric("Regex Extracted", report["regex_extracted"])
+                    cols[2].metric("LLM Extracted", report["llm_extracted"])
+                    cols[3].metric("Avg Confidence", f"{report['confidence_avg']:.0%}")
+
+                    if report.get("warnings"):
+                        st.markdown("**Warnings:**")
+                        for warning in report["warnings"]:
+                            st.caption(f"- {warning}")
 
 
 # --- Main Content ---
